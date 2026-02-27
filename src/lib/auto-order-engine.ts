@@ -191,7 +191,11 @@ export async function executeAutoOrders(overrideTime?: string): Promise<AutoOrde
                 console.log(`[AutoOrder Engine]    🔄 Starting Firestore transaction...`);
 
                 await adminDb.runTransaction(async (transaction) => {
-                    // READ PHASE
+                    // ══════════════════════════════════════
+                    // READ PHASE — all reads MUST come first
+                    // ══════════════════════════════════════
+
+                    // 1. Read user document
                     const userRef = adminDb.collection("users").doc(autoOrder.userId);
                     const userDoc = await transaction.get(userRef);
 
@@ -204,9 +208,77 @@ export async function executeAutoOrders(overrideTime?: string): Promise<AutoOrde
                     const walletBalance = userData.walletBalance ?? 0;
                     console.log(`[AutoOrder Engine]    👛 Wallet balance: ₹${walletBalance}`);
 
-                    // ─── Insufficient balance ───
+                    // 2. Read menu item document (for stock validation)
+                    const menuItemRef = adminDb.collection("menuItems").doc(autoOrder.itemId);
+                    const menuItemDoc = await transaction.get(menuItemRef);
+
+                    if (!menuItemDoc.exists) {
+                        console.error(`[AutoOrder Engine]    ❌ Menu item ${autoOrder.itemId} ("${autoOrder.itemName}") not found`);
+                        throw new Error("ITEM_NOT_FOUND");
+                    }
+
+                    const menuItemData = menuItemDoc.data()!;
+                    const currentStock = menuItemData.quantity ?? 0;
+                    const isAvailable = menuItemData.available !== false;
+                    console.log(`[AutoOrder Engine]    📦 Menu item "${menuItemData.name}": stock=${currentStock}, available=${isAvailable}`);
+
+                    // ══════════════════════════════════════
+                    // VALIDATION PHASE
+                    // ══════════════════════════════════════
+
+                    // 3. Check item availability
+                    if (!isAvailable) {
+                        console.log(`[AutoOrder Engine]    🚫 Item "${autoOrder.itemName}" is marked unavailable`);
+
+                        const execRef = adminDb.collection("autoOrderExecutions").doc();
+                        transaction.set(execRef, {
+                            autoOrderId,
+                            userId: autoOrder.userId,
+                            success: false,
+                            failureReason: `Item "${autoOrder.itemName}" is unavailable`,
+                            executedAt: now.toISOString(),
+                        });
+
+                        transaction.update(autoOrderDoc.ref, {
+                            lastExecutedDate: ist.dateStr,
+                            lastExecutedAt: now.toISOString(),
+                            lastFailedAt: now.toISOString(),
+                            lastFailureReason: `Item "${autoOrder.itemName}" is currently unavailable`,
+                            totalFailures: FieldValue.increment(1),
+                            updatedAt: now.toISOString(),
+                        });
+
+                        throw new Error("ITEM_UNAVAILABLE");
+                    }
+
+                    // 4. Check stock quantity
+                    if (currentStock < autoOrder.quantity) {
+                        console.log(`[AutoOrder Engine]    📉 INSUFFICIENT STOCK: ${currentStock} available < ${autoOrder.quantity} needed`);
+
+                        const execRef = adminDb.collection("autoOrderExecutions").doc();
+                        transaction.set(execRef, {
+                            autoOrderId,
+                            userId: autoOrder.userId,
+                            success: false,
+                            failureReason: `Insufficient stock: ${currentStock} available, ${autoOrder.quantity} needed`,
+                            executedAt: now.toISOString(),
+                        });
+
+                        transaction.update(autoOrderDoc.ref, {
+                            lastExecutedDate: ist.dateStr,
+                            lastExecutedAt: now.toISOString(),
+                            lastFailedAt: now.toISOString(),
+                            lastFailureReason: `Insufficient stock for "${autoOrder.itemName}" (${currentStock} left, ${autoOrder.quantity} needed)`,
+                            totalFailures: FieldValue.increment(1),
+                            updatedAt: now.toISOString(),
+                        });
+
+                        throw new Error("INSUFFICIENT_STOCK");
+                    }
+
+                    // 5. Check wallet balance
                     if (walletBalance < total) {
-                        console.log(`[AutoOrder Engine]    💸 INSUFFICIENT: ₹${walletBalance} < ₹${total}`);
+                        console.log(`[AutoOrder Engine]    💸 INSUFFICIENT BALANCE: ₹${walletBalance} < ₹${total}`);
 
                         const execRef = adminDb.collection("autoOrderExecutions").doc();
                         transaction.set(execRef, {
@@ -229,19 +301,31 @@ export async function executeAutoOrders(overrideTime?: string): Promise<AutoOrde
                         throw new Error("INSUFFICIENT_BALANCE");
                     }
 
-                    // ─── Success path ───
-                    console.log(`[AutoOrder Engine]    ✅ Balance sufficient — creating order...`);
+                    // ══════════════════════════════════════
+                    // WRITE PHASE — all writes after reads
+                    // ══════════════════════════════════════
+
+                    console.log(`[AutoOrder Engine]    ✅ All validations passed — executing writes...`);
 
                     const orderId = generateOrderId();
                     console.log(`[AutoOrder Engine]    📝 Generated order ID: ${orderId}`);
 
-                    // 1. Deduct wallet
+                    // W1. Deduct stock from menu item
+                    const newStock = currentStock - autoOrder.quantity;
+                    transaction.update(menuItemRef, {
+                        quantity: newStock,
+                        available: newStock > 0,
+                        updatedAt: now.toISOString(),
+                    });
+                    console.log(`[AutoOrder Engine]    📦 Stock deducted: ${currentStock} → ${newStock} (available: ${newStock > 0})`);
+
+                    // W2. Deduct wallet balance
                     transaction.update(userRef, {
                         walletBalance: FieldValue.increment(-total),
                     });
-                    console.log(`[AutoOrder Engine]    💳 Wallet deduction: -₹${total}`);
+                    console.log(`[AutoOrder Engine]    💳 Wallet deduction: -₹${total} (₹${walletBalance} → ₹${walletBalance - total})`);
 
-                    // 2. Create order
+                    // W3. Create order document
                     const orderRef = adminDb.collection("orders").doc();
                     transaction.set(orderRef, {
                         orderId,
@@ -263,9 +347,9 @@ export async function executeAutoOrders(overrideTime?: string): Promise<AutoOrde
                         createdAt: now.toISOString(),
                         updatedAt: now.toISOString(),
                     });
-                    console.log(`[AutoOrder Engine]    📦 Order created in "orders" collection`);
+                    console.log(`[AutoOrder Engine]    📦 Order document created in "orders" collection`);
 
-                    // 3. Wallet transaction record
+                    // W4. Create wallet transaction record
                     const txnRef = adminDb.collection("walletTransactions").doc();
                     transaction.set(txnRef, {
                         userId: autoOrder.userId,
@@ -277,20 +361,20 @@ export async function executeAutoOrders(overrideTime?: string): Promise<AutoOrde
                     });
                     console.log(`[AutoOrder Engine]    💵 Wallet transaction recorded`);
 
-                    // 4. Notification
+                    // W5. Create notification document
                     const notifRef = adminDb.collection("notifications").doc();
                     transaction.set(notifRef, {
                         userId: autoOrder.userId,
+                        orderId,
                         type: "auto_order",
                         title: "Auto Order Placed ✅",
                         message: `${autoOrder.itemName} x${autoOrder.quantity} (₹${total}) placed automatically.`,
-                        orderId,
-                        read: false,
+                        isRead: false,
                         createdAt: now.toISOString(),
                     });
-                    console.log(`[AutoOrder Engine]    🔔 Notification created`);
+                    console.log(`[AutoOrder Engine]    🔔 Notification created in "notifications" collection`);
 
-                    // 5. Execution log
+                    // W6. Create execution log
                     const execRef = adminDb.collection("autoOrderExecutions").doc();
                     transaction.set(execRef, {
                         autoOrderId,
@@ -298,11 +382,13 @@ export async function executeAutoOrders(overrideTime?: string): Promise<AutoOrde
                         orderId,
                         success: true,
                         amountDeducted: total,
+                        stockBefore: currentStock,
+                        stockAfter: newStock,
                         executedAt: now.toISOString(),
                     });
                     console.log(`[AutoOrder Engine]    📋 Execution log recorded`);
 
-                    // 6. Update auto order tracking
+                    // W7. Update auto order tracking
                     transaction.update(autoOrderDoc.ref, {
                         lastExecutedDate: ist.dateStr,
                         lastExecutedAt: now.toISOString(),
@@ -323,6 +409,15 @@ export async function executeAutoOrders(overrideTime?: string): Promise<AutoOrde
                 } else if (errMsg === "USER_NOT_FOUND") {
                     console.error(`[AutoOrder Engine]    ❌ FAILED — user ${autoOrder.userId} not found`);
                     errors.push(`${autoOrderId}: user not found`);
+                } else if (errMsg === "ITEM_NOT_FOUND") {
+                    console.error(`[AutoOrder Engine]    ❌ FAILED — menu item ${autoOrder.itemId} not found`);
+                    errors.push(`${autoOrderId}: menu item not found`);
+                } else if (errMsg === "ITEM_UNAVAILABLE") {
+                    console.log(`[AutoOrder Engine]    🚫 FAILED — item "${autoOrder.itemName}" unavailable`);
+                    errors.push(`${autoOrderId}: item unavailable`);
+                } else if (errMsg === "INSUFFICIENT_STOCK") {
+                    console.log(`[AutoOrder Engine]    📉 FAILED — insufficient stock for "${autoOrder.itemName}"`);
+                    errors.push(`${autoOrderId}: insufficient stock`);
                 } else {
                     console.error(`[AutoOrder Engine]    ❌ FAILED — ${errMsg}`);
                     errors.push(`${autoOrderId}: ${errMsg}`);
